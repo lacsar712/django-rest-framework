@@ -1,18 +1,18 @@
 """
 Provides an APIView class that is the base of all views in REST framework.
 """
+from django import VERSION as DJANGO_VERSION
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import connections, models
-from django.http import Http404
+from django.http import Http404, StreamingHttpResponse
 from django.http.response import HttpResponseBase
-from django.utils.cache import patch_vary_headers
+from django.utils.cache import cc_delim_re, patch_vary_headers
 from django.utils.encoding import smart_str
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import View
 
-from rest_framework import exceptions, status
-from rest_framework.compat import split_header_value
+from rest_framework import exceptions, runtime_policy, status
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.schemas import DefaultSchema
@@ -64,7 +64,7 @@ def get_view_description(view, html=False):
 
 
 def set_rollback():
-    for db in connections.all(initialized_only=True):
+    for db in connections.all():
         if db.settings_dict['ATOMIC_REQUESTS'] and db.in_atomic_block:
             db.set_rollback(True)
 
@@ -142,7 +142,8 @@ class APIView(View):
 
         # Exempt all DRF views from Django's LoginRequiredMiddleware. Users should set
         # DEFAULT_PERMISSION_CLASSES to 'rest_framework.permissions.IsAuthenticated' instead
-        view.login_required = False
+        if DJANGO_VERSION >= (5, 1):
+            view.login_required = False
 
         # Note: session based authentication is explicitly CSRF validated,
         # all other authentication is CSRF exempt.
@@ -439,11 +440,16 @@ class APIView(View):
             response.accepted_renderer = request.accepted_renderer
             response.accepted_media_type = request.accepted_media_type
             response.renderer_context = self.get_renderer_context()
+        elif isinstance(response, StreamingHttpResponse):
+            # Wire streaming writes to the current policy frame: each chunk
+            # re-checks the stack and the iterator is registered for
+            # force-close. No-op when the stack is empty.
+            runtime_policy.guard_streaming_response(response)
 
         # Add new vary headers to the response instead of overwriting.
         vary_headers = self.headers.pop('Vary', None)
         if vary_headers is not None:
-            patch_vary_headers(response, list(split_header_value(vary_headers)))
+            patch_vary_headers(response, cc_delim_re.split(vary_headers))
 
         for key, value in self.headers.items():
             response[key] = value
@@ -489,20 +495,8 @@ class APIView(View):
     # be overridden.
     def dispatch(self, request, *args, **kwargs):
         """
-        Dispatch the incoming request to the appropriate handler method.
-
-        This method implements the core request/response lifecycle for
-        Django REST Framework views:
-
-        1. Wraps the incoming Django HttpRequest in a REST framework Request.
-        2. Performs content negotiation, authentication, permission, and
-            throttling checks.
-        3. Resolves and calls the appropriate HTTP method handler
-            (e.g. get(), post(), put()).
-        4. Handles any exceptions raised during processing and converts
-            them into appropriate Response objects.
-        5. Finalizes and returns the response with proper rendering
-            and headers applied.
+        `.dispatch()` is pretty much the same as Django's regular dispatch,
+        but with extra hooks for startup, finalize, and exception handling.
         """
         self.args = args
         self.kwargs = kwargs
@@ -510,23 +504,29 @@ class APIView(View):
         self.request = request
         self.headers = self.default_response_headers  # deprecate?
 
-        try:
-            self.initial(request, *args, **kwargs)
+        # Bind a request-scoped runtime policy stack to this request. The
+        # stack is ambient (contextvars), never an attribute of this view,
+        # request or response, and is isolated from concurrent requests. An
+        # outer scope (middleware, nested dispatch) is shared rather than
+        # replaced.
+        with runtime_policy.request_scope():
+            try:
+                self.initial(request, *args, **kwargs)
 
-            # Get the appropriate handler method
-            if request.method.lower() in self.http_method_names:
-                handler = getattr(self, request.method.lower(),
-                                  self.http_method_not_allowed)
-            else:
-                handler = self.http_method_not_allowed
+                # Get the appropriate handler method
+                if request.method.lower() in self.http_method_names:
+                    handler = getattr(self, request.method.lower(),
+                                      self.http_method_not_allowed)
+                else:
+                    handler = self.http_method_not_allowed
 
-            response = handler(request, *args, **kwargs)
+                response = handler(request, *args, **kwargs)
 
-        except Exception as exc:
-            response = self.handle_exception(exc)
+            except Exception as exc:
+                response = self.handle_exception(exc)
 
-        self.response = self.finalize_response(request, response, *args, **kwargs)
-        return self.response
+            self.response = self.finalize_response(request, response, *args, **kwargs)
+            return self.response
 
     def options(self, request, *args, **kwargs):
         """

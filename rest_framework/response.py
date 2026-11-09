@@ -8,6 +8,7 @@ from http.client import responses
 
 from django.template.response import SimpleTemplateResponse
 
+from rest_framework import runtime_policy
 from rest_framework.serializers import Serializer
 
 
@@ -59,6 +60,13 @@ class Response(SimpleTemplateResponse):
         assert renderer, ".accepted_renderer not set on Response"
         assert accepted_media_type, ".accepted_media_type not set on Response"
         assert context is not None, ".renderer_context not set on Response"
+
+        # Single render choke point for every renderer: the current top
+        # runtime policy frame decides whether rendering may start. A denial
+        # raises before any renderer runs and before the response could be
+        # marked rendered.
+        runtime_policy.guard_render(self, renderer)
+
         context['response'] = self
 
         media_type = renderer.media_type
